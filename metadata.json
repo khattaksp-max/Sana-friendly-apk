@@ -1,0 +1,6 @@
+{
+  "name": "SANA",
+  "description": "Natural voice AI companion featuring authentic Gemini speech, personality modes, Boss & Romantic modes, voice preview, and live interactive voice chat.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
