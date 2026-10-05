@@ -1,8 +1,9 @@
 package com.example.network
 
-import android.util.Log
+import android.util.Base64
 import com.example.BuildConfig
 import com.example.data.AssistantMode
+import com.example.util.SanaLogger
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
@@ -30,7 +31,7 @@ sealed class GeminiVoiceResult {
 
 class GeminiVoiceService {
 
-    private val TAG = "GeminiVoiceService"
+    private val COMPONENT = "GeminiVoiceService"
     private val JSON_MEDIA = "application/json; charset=utf-8".toMediaType()
 
     private val client = OkHttpClient.Builder()
@@ -39,11 +40,16 @@ class GeminiVoiceService {
         .writeTimeout(60, TimeUnit.SECONDS)
         .build()
 
+    var customApiKey: String? = null
+
     val apiKey: String
-        get() = try {
-            BuildConfig.GEMINI_API_KEY
-        } catch (e: Exception) {
-            ""
+        get() {
+            if (!customApiKey.isNullOrBlank()) return customApiKey!!.trim()
+            return try {
+                BuildConfig.GEMINI_API_KEY.trim()
+            } catch (e: Exception) {
+                ""
+            }
         }
 
     fun isApiKeyConfigured(): Boolean {
@@ -52,44 +58,57 @@ class GeminiVoiceService {
     }
 
     /**
-     * Executes the conversational turn and speech synthesis using real Gemini Native Audio.
+     * Executes conversational turn with Gemini.
+     * Supports real microphone WAV audio bytes AND/OR text input.
      */
     suspend fun processVoiceTurn(
-        userInput: String,
+        userAudioBytes: ByteArray? = null,
+        userInputText: String? = null,
         mode: AssistantMode,
         voiceName: String,
         history: List<Pair<String, String>>,
         memoryNotes: List<String> = emptyList()
     ): GeminiVoiceResult = withContext(Dispatchers.IO) {
         if (!isApiKeyConfigured()) {
+            SanaLogger.e(COMPONENT, "Gemini API key is not configured")
             return@withContext GeminiVoiceResult.Error(
-                message = "Gemini AI is not configured yet. Please add the required API configuration in the Secrets panel or .env file.",
+                message = "Gemini AI is not configured yet. Please add the required API configuration in the Secrets panel, .env file, or Settings.",
                 isConfigurationError = true,
                 canRetry = false
             )
         }
 
+        val audioDesc = if (userAudioBytes != null) "${userAudioBytes.size} bytes audio" else "text only"
+        SanaLogger.i(COMPONENT, "Sending user input to Gemini ($audioDesc). Mode: ${mode.name}, Voice: $voiceName")
+
         try {
-            // Step 1: Generate conversational text response in matching language and style
             val systemInstruction = buildSystemPrompt(mode, memoryNotes)
-            val textResponse = generateText(userInput, systemInstruction, history)
+
+            // Step 1: Generate response text
+            val textResponse = generateText(userAudioBytes, userInputText, systemInstruction, history)
 
             if (textResponse.isNullOrBlank()) {
+                SanaLogger.w(COMPONENT, "Gemini returned empty text response")
                 return@withContext GeminiVoiceResult.Error(
-                    message = "Could not generate response. Please check your network and try again.",
+                    message = "Could not generate response from voice. Please check network connection and try again.",
                     canRetry = true
                 )
             }
 
-            // Step 2: Generate REAL Gemini Native Audio with specified voice
+            SanaLogger.i(COMPONENT, "Gemini response text received (${textResponse.length} chars). Generating Native Audio...")
+
+            // Step 2: Generate REAL Gemini Native Audio with Kore / Aoede voice
             val (base64Audio, mimeType) = synthesizeNativeAudioDirect(textResponse, voiceName, mode)
 
             if (base64Audio.isNullOrBlank()) {
+                SanaLogger.e(COMPONENT, "Gemini Native Audio synthesis did not return audio")
                 return@withContext GeminiVoiceResult.Error(
                     message = "Gemini Native Audio synthesis did not return audio. Please retry.",
                     canRetry = true
                 )
             }
+
+            SanaLogger.i(COMPONENT, "Gemini Native Audio response received (${base64Audio.length} base64 chars).")
 
             GeminiVoiceResult.Success(
                 text = textResponse,
@@ -97,7 +116,7 @@ class GeminiVoiceService {
                 audioMimeType = mimeType ?: "audio/wav"
             )
         } catch (e: Exception) {
-            Log.e(TAG, "processVoiceTurn exception", e)
+            SanaLogger.e(COMPONENT, "processVoiceTurn exception", e)
             val msg = e.localizedMessage ?: "Network error communicating with Gemini"
             GeminiVoiceResult.Error(
                 message = if (msg.contains("403") || msg.contains("API_KEY")) {
@@ -111,13 +130,13 @@ class GeminiVoiceService {
     }
 
     private suspend fun generateText(
-        userInput: String,
+        userAudioBytes: ByteArray?,
+        userInputText: String?,
         systemInstruction: String,
         history: List<Pair<String, String>>
     ): String? = withContext(Dispatchers.IO) {
         val contentsArray = JSONArray()
 
-        // Include last 6 turns for context
         val recentHistory = history.takeLast(6)
         for ((role, text) in recentHistory) {
             val turnObj = JSONObject()
@@ -133,9 +152,33 @@ class GeminiVoiceService {
         val currentUserObj = JSONObject()
         currentUserObj.put("role", "user")
         val currentParts = JSONArray()
-        val currentPart = JSONObject()
-        currentPart.put("text", userInput)
-        currentParts.put(currentPart)
+
+        // If recorded microphone audio is provided, attach as inlineData audio/wav
+        if (userAudioBytes != null && userAudioBytes.isNotEmpty()) {
+            val base64Audio = Base64.encodeToString(userAudioBytes, Base64.NO_WRAP)
+            val audioPart = JSONObject().apply {
+                val inlineData = JSONObject().apply {
+                    put("mimeType", "audio/wav")
+                    put("data", base64Audio)
+                }
+                put("inlineData", inlineData)
+            }
+            currentParts.put(audioPart)
+        }
+
+        // If text or transcript is available, attach as text part
+        if (!userInputText.isNullOrBlank()) {
+            val textPart = JSONObject().apply {
+                put("text", userInputText)
+            }
+            currentParts.put(textPart)
+        } else if (userAudioBytes != null) {
+            val promptPart = JSONObject().apply {
+                put("text", "Please listen to the user's voice message above and reply naturally, warmly, and concisely.")
+            }
+            currentParts.put(promptPart)
+        }
+
         currentUserObj.put("parts", currentParts)
         contentsArray.put(currentUserObj)
 
@@ -157,29 +200,53 @@ class GeminiVoiceService {
             put("generationConfig", genConfig)
         }
 
-        val request = Request.Builder()
-            .url("https://generativelanguage.googleapis.com/v1beta/models/gemini-3.5-flash:generateContent?key=$apiKey")
-            .post(payload.toString().toRequestBody(JSON_MEDIA))
-            .build()
+        // Try gemini-2.5-flash (multimodal audio) first, fallback to gemini-3.5-flash
+        val models = listOf("gemini-2.5-flash", "gemini-3.5-flash")
+        for (model in models) {
+            try {
+                val request = Request.Builder()
+                    .url("https://generativelanguage.googleapis.com/v1beta/models/$model:generateContent?key=$apiKey")
+                    .post(payload.toString().toRequestBody(JSON_MEDIA))
+                    .build()
 
-        val response = client.newCall(request).execute()
-        val responseBody = response.body?.string() ?: ""
+                val response = client.newCall(request).execute()
+                val responseBody = response.body?.string() ?: ""
 
-        if (!response.isSuccessful) {
-            Log.e(TAG, "Gemini text gen failed: ${response.code} $responseBody")
-            return@withContext null
+                if (response.isSuccessful) {
+                    val json = JSONObject(responseBody)
+                    val candidates = json.optJSONArray("candidates")
+                    val firstCandidate = candidates?.optJSONObject(0)
+                    val content = firstCandidate?.optJSONObject("content")
+                    val parts = content?.optJSONArray("parts")
+
+                    var textResult: String? = null
+                    for (i in 0 until (parts?.length() ?: 0)) {
+                        val p = parts?.optJSONObject(i)
+                        val t = p?.optString("text")
+                        if (!t.isNullOrBlank()) {
+                            textResult = t
+                            break
+                        }
+                    }
+
+                    if (!textResult.isNullOrBlank()) {
+                        return@withContext cleanSpokenText(textResult)
+                    }
+                } else {
+                    SanaLogger.w(COMPONENT, "Model $model returned HTTP ${response.code}: $responseBody")
+                }
+            } catch (e: Exception) {
+                SanaLogger.w(COMPONENT, "Exception with model $model: ${e.message}")
+            }
         }
 
-        val json = JSONObject(responseBody)
-        val candidates = json.optJSONArray("candidates")
-        val firstCandidate = candidates?.optJSONObject(0)
-        val content = firstCandidate?.optJSONObject("content")
-        val parts = content?.optJSONArray("parts")
-        val text = parts?.optJSONObject(0)?.optString("text")
-
-        cleanSpokenText(text ?: "")
+        null
     }
 
+    /**
+     * Synthesizes audio using Gemini Native Audio model with the chosen voice.
+     * Iterates through ALL parts in the response to extract the audio payload.
+     */
     suspend fun synthesizeNativeAudioDirect(
         text: String,
         voiceName: String,
@@ -188,6 +255,7 @@ class GeminiVoiceService {
         if (!isApiKeyConfigured()) {
             return@withContext Pair(null, null)
         }
+
         val validVoice = when (voiceName.trim().lowercase()) {
             "aoede" -> "Aoede"
             "sulafat" -> "Sulafat"
@@ -199,9 +267,9 @@ class GeminiVoiceService {
         }
 
         val speechPrompt = when (mode) {
-            AssistantMode.ROMANTIC -> "Speak with an affectionate, warm, gentle, and soft feminine voice: "
-            AssistantMode.COMPANION -> "Speak with a deeply caring, soothing, and supportive feminine voice: "
-            AssistantMode.FRIEND -> "Speak in a cheerful, sunny, friendly, and lively feminine tone: "
+            AssistantMode.ROMANTIC -> "Speak in a warm, gentle, affectionate, and playful tone: "
+            AssistantMode.COMPANION -> "Speak in a comforting, deeply empathetic, and soothing tone: "
+            AssistantMode.FRIEND -> "Speak in a cheerful, sunny, friendly, and lively tone: "
             AssistantMode.ASSISTANT -> "Speak clearly, naturally, and warmly: "
         }
 
@@ -232,7 +300,12 @@ class GeminiVoiceService {
             put("generationConfig", genConfig)
         }
 
-        val ttsModels = listOf("gemini-2.5-flash-preview-tts", "gemini-2.5-flash")
+        val ttsModels = listOf(
+            "gemini-2.5-flash-native-audio-preview-12-2025",
+            "gemini-2.5-flash-preview-tts",
+            "gemini-2.5-flash"
+        )
+
         for (model in ttsModels) {
             try {
                 val request = Request.Builder()
@@ -249,19 +322,25 @@ class GeminiVoiceService {
                     val firstCandidate = candidates?.optJSONObject(0)
                     val content = firstCandidate?.optJSONObject("content")
                     val parts = content?.optJSONArray("parts")
-                    val firstPart = parts?.optJSONObject(0)
-                    val inlineData = firstPart?.optJSONObject("inlineData")
-                    val base64Data = inlineData?.optString("data")
-                    val mimeType = inlineData?.optString("mimeType")
 
-                    if (!base64Data.isNullOrBlank()) {
-                        return@withContext Pair(base64Data, mimeType ?: "audio/wav")
+                    val partsCount = parts?.length() ?: 0
+                    for (i in 0 until partsCount) {
+                        val partObj = parts?.optJSONObject(i)
+                        val inlineData = partObj?.optJSONObject("inlineData")
+                        if (inlineData != null) {
+                            val base64Data = inlineData.optString("data")
+                            val mimeType = inlineData.optString("mimeType", "audio/wav")
+                            if (!base64Data.isNullOrBlank()) {
+                                SanaLogger.i(COMPONENT, "Extracted native audio from model $model ($mimeType)")
+                                return@withContext Pair(base64Data, mimeType)
+                            }
+                        }
                     }
                 } else {
-                    Log.w(TAG, "Audio synthesis failed with model $model: ${response.code} $responseBody")
+                    SanaLogger.w(COMPONENT, "TTS model $model returned HTTP ${response.code}")
                 }
             } catch (e: Exception) {
-                Log.w(TAG, "Exception calling TTS model $model", e)
+                SanaLogger.w(COMPONENT, "Exception with TTS model $model: ${e.message}")
             }
         }
 

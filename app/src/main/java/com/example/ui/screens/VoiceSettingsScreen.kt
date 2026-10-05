@@ -467,7 +467,81 @@ fun VoiceSettingsScreen(
             }
         }
 
-        // 5. Romance Boundaries & Privacy Notice
+        // 5. Gemini API Configuration
+        val isConfigured = viewModel.isGeminiConfigured()
+        var customKeyInput by remember { mutableStateOf("") }
+        var showKeyInput by remember { mutableStateOf(!isConfigured) }
+
+        Card(
+            modifier = Modifier.fillMaxWidth(),
+            shape = RoundedCornerShape(16.dp),
+            colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f)),
+            border = androidx.compose.foundation.BorderStroke(1.dp, MaterialTheme.colorScheme.outline.copy(alpha = 0.2f))
+        ) {
+            Column(modifier = Modifier.padding(16.dp)) {
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.SpaceBetween,
+                    verticalAlignment = Alignment.CenterVertically
+                ) {
+                    Text(
+                        text = "GEMINI AI CONFIGURATION",
+                        style = MaterialTheme.typography.labelSmall.copy(
+                            fontWeight = FontWeight.Bold,
+                            letterSpacing = 1.sp
+                        ),
+                        color = if (isConfigured) Color(0xFF4CAF50) else SanaPink
+                    )
+
+                    Surface(
+                        shape = RoundedCornerShape(8.dp),
+                        color = if (isConfigured) Color(0xFF4CAF50).copy(alpha = 0.15f) else SanaPink.copy(alpha = 0.15f)
+                    ) {
+                        Text(
+                            text = if (isConfigured) "Configured ✓" else "Not Configured ✗",
+                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
+                            color = if (isConfigured) Color(0xFF4CAF50) else SanaPink,
+                            modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                        )
+                    }
+                }
+
+                Spacer(modifier = Modifier.height(6.dp))
+                Text(
+                    text = "Configured via Secrets panel or enter your GEMINI_API_KEY below to activate SANA on any device.",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                OutlinedTextField(
+                    value = customKeyInput,
+                    onValueChange = { customKeyInput = it },
+                    placeholder = { Text("Paste GEMINI_API_KEY here...") },
+                    modifier = Modifier.fillMaxWidth().testTag("input_gemini_api_key"),
+                    singleLine = true,
+                    shape = RoundedCornerShape(10.dp)
+                )
+
+                Spacer(modifier = Modifier.height(8.dp))
+                Button(
+                    onClick = {
+                        if (customKeyInput.isNotBlank()) {
+                            viewModel.saveCustomApiKey(customKeyInput)
+                            customKeyInput = ""
+                        }
+                    },
+                    enabled = customKeyInput.isNotBlank(),
+                    colors = ButtonDefaults.buttonColors(containerColor = SanaPink),
+                    shape = RoundedCornerShape(10.dp),
+                    modifier = Modifier.fillMaxWidth().testTag("btn_save_gemini_api_key")
+                ) {
+                    Text("Save API Key")
+                }
+            }
+        }
+
+        // 6. Romance Boundaries & Privacy Notice
         Card(
             modifier = Modifier.fillMaxWidth(),
             shape = RoundedCornerShape(16.dp),

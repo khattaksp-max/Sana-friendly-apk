@@ -1,13 +1,15 @@
 package com.example.viewmodel
 
+import android.Manifest
 import android.app.Application
+import android.content.Context
 import android.content.pm.PackageManager
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
+import com.example.audio.AudioCaptureManager
 import com.example.audio.AudioPlayerManager
 import com.example.audio.PhoneActionController
-import com.example.audio.VoiceInputManager
 import com.example.data.AssistantMode
 import com.example.data.AvailableVoices
 import com.example.data.ChatMessage
@@ -18,6 +20,7 @@ import com.example.data.StoredPreference
 import com.example.data.VoiceState
 import com.example.network.GeminiVoiceResult
 import com.example.network.GeminiVoiceService
+import com.example.util.SanaLogger
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
@@ -31,17 +34,21 @@ import kotlinx.coroutines.launch
 sealed class UiEvent {
     data class ShowSnackbar(val message: String) : UiEvent()
     data class NavigateToTab(val tabIndex: Int) : UiEvent()
+    object OpenAppSettings : UiEvent()
 }
 
 class SanaViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val COMPONENT = "SanaViewModel"
+    private val prefs = application.getSharedPreferences("sana_app_prefs", Context.MODE_PRIVATE)
 
     private val audioPlayer = AudioPlayerManager(application)
     private val geminiService = GeminiVoiceService()
     private val phoneActionController = PhoneActionController(application)
     val memoryManager = SanaMemoryManager(application)
 
-    private val voiceInput = VoiceInputManager(application) {
-        // User started speaking while audio was playing -> immediate barge-in / stop playback!
+    // Real microphone PCM capture with VAD and echo cancellation
+    private val audioCapture = AudioCaptureManager(application) {
         interruptSpeaking()
     }
 
@@ -80,38 +87,54 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
     private val _uiEvents = MutableSharedFlow<UiEvent>()
     val uiEvents: SharedFlow<UiEvent> = _uiEvents.asSharedFlow()
 
-    val isListening: StateFlow<Boolean> = voiceInput.isListening
-    val recognizedSpeechText: StateFlow<String> = voiceInput.recognizedText
-    val micSoundLevel: StateFlow<Float> = voiceInput.soundLevel
+    val isListening: StateFlow<Boolean> = audioCapture.isListening
+    val recognizedSpeechText: StateFlow<String> = audioCapture.recognizedText
+    val micSoundLevel: StateFlow<Float> = audioCapture.soundLevel
     val isPlayingAudio: StateFlow<Boolean> = audioPlayer.isPlaying
     val memories: StateFlow<List<StoredPreference>> = memoryManager.memories
 
     private var activeJob: Job? = null
     private var lastUserTurnText: String? = null
+    private var lastUserAudioBytes: ByteArray? = null
 
     init {
-        // Setup Voice Input Listeners
-        voiceInput.onEndOfSpeechListener = {
-            if (_voiceState.value == VoiceState.LISTENING) {
-                _voiceState.value = VoiceState.PROCESSING
-            }
+        // Load custom API key if user saved one
+        val savedApiKey = prefs.getString("custom_gemini_api_key", null)
+        if (!savedApiKey.isNullOrBlank()) {
+            geminiService.customApiKey = savedApiKey
         }
 
-        voiceInput.onSpeechResultListener = { recognizedText ->
-            if (recognizedText.isNotBlank()) {
-                handleUserVoiceInput(recognizedText)
-            }
-        }
-
-        voiceInput.onErrorListener = { errorMsg ->
+        // Audio focus loss / phone call interruptions
+        audioPlayer.onAudioFocusLossListener = {
+            SanaLogger.w(COMPONENT, "Audio focus lost. Stopping playback and conversation.")
+            interruptSpeaking()
             if (_isContinuousMode.value) {
-                // If temporary no speech in continuous loop, restart listening after a moment
-                if (errorMsg.contains("No speech", ignoreCase = true) || errorMsg.contains("timeout", ignoreCase = true)) {
+                _isContinuousMode.value = false
+                _voiceState.value = VoiceState.IDLE
+            }
+        }
+
+        // Voice Activity Detection listeners
+        audioCapture.onSpeechStartedListener = {
+            if (_voiceState.value == VoiceState.LISTENING) {
+                SanaLogger.i(COMPONENT, "User is actively speaking")
+            }
+        }
+
+        audioCapture.onSpeechFinishedListener = { wavBytes, transcript ->
+            handleCapturedVoice(wavBytes, transcript)
+        }
+
+        audioCapture.onErrorListener = { errorMsg ->
+            SanaLogger.e(COMPONENT, "Microphone capture error: $errorMsg")
+            if (_isContinuousMode.value) {
+                // If microphone timed out with no speech in continuous loop, restart listening after guard pause
+                if (errorMsg.contains("timed out", ignoreCase = true) || errorMsg.contains("No speech", ignoreCase = true)) {
                     viewModelScope.launch {
                         delay(400)
                         if (_isContinuousMode.value && _voiceState.value != VoiceState.SPEAKING) {
                             _voiceState.value = VoiceState.LISTENING
-                            voiceInput.startListening()
+                            audioCapture.startListening()
                         }
                     }
                 } else {
@@ -119,16 +142,11 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
                     _lastErrorMessage.value = errorMsg
                 }
             } else {
-                if (!errorMsg.contains("No speech", ignoreCase = true)) {
-                    _voiceState.value = VoiceState.ERROR
-                    _lastErrorMessage.value = errorMsg
-                } else {
-                    _voiceState.value = VoiceState.IDLE
-                }
+                _voiceState.value = VoiceState.ERROR
+                _lastErrorMessage.value = errorMsg
             }
         }
 
-        // Add welcome message if chat is empty
         val welcome = ChatMessage(
             sender = MessageSender.SANA,
             text = "Hello! I'm SANA. Tap Start Conversation for hands-free voice chat, or type a message below.",
@@ -137,37 +155,27 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
         _messages.value = listOf(welcome)
     }
 
-    fun triggerInitialGreeting() {
-        if (_messages.value.size <= 1 && isGeminiConfigured()) {
-            val greetingText = "Hello! I'm SANA. I'm listening and ready whenever you want to talk."
-            viewModelScope.launch {
-                delay(400)
-                val (base64, mimeType) = geminiService.synthesizeNativeAudioDirect(
-                    text = greetingText,
-                    voiceName = selectedVoice.value.id,
-                    mode = assistantMode.value
-                )
-                if (!base64.isNullOrBlank()) {
-                    _voiceState.value = VoiceState.SPEAKING
-                    audioPlayer.playGeminiNativeAudio(base64, mimeType) {
-                        _voiceState.value = VoiceState.IDLE
-                    }
-                }
-            }
-        }
+    fun hasRecordAudioPermission(): Boolean {
+        val app = getApplication<Application>()
+        val granted = ContextCompat.checkSelfPermission(
+            app,
+            Manifest.permission.RECORD_AUDIO
+        ) == PackageManager.PERMISSION_GRANTED
+        SanaLogger.i(COMPONENT, "Microphone permission status: $granted")
+        return granted
     }
 
     /**
      * ONE-CLICK START:
-     * User taps Start Conversation ONCE. SANA continuously listens, understands,
+     * User taps Start Conversation ONCE. SANA continuously listens with AudioRecord PCM,
      * speaks real Gemini Native Audio, and automatically resumes listening!
      */
     fun startContinuousConversation(hasMicPermission: Boolean) {
-        if (!hasMicPermission) {
+        if (!hasMicPermission || !hasRecordAudioPermission()) {
             _voiceState.value = VoiceState.ERROR
-            _lastErrorMessage.value = "Microphone permission required for voice conversation."
+            _lastErrorMessage.value = "Microphone permission is required for voice conversation."
             viewModelScope.launch {
-                _uiEvents.emit(UiEvent.ShowSnackbar("Please grant Microphone permission to talk with SANA."))
+                _uiEvents.emit(UiEvent.ShowSnackbar("Microphone permission is required for voice conversation."))
             }
             return
         }
@@ -176,17 +184,19 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
         _isContinuousMode.value = true
         _lastErrorMessage.value = null
         _voiceState.value = VoiceState.LISTENING
-        voiceInput.startListening()
+        SanaLogger.i(COMPONENT, "Starting continuous conversation loop with AudioRecord")
+        audioCapture.startListening()
     }
 
     /**
      * CLEARLY VISIBLE STOP BUTTON:
-     * Immediately stops microphone, terminates continuous loop, stops audio playback, returns to IDLE.
+     * Immediately stops microphone, terminates continuous loop, stops audio playback, releases resources.
      */
     fun stopContinuousConversation() {
+        SanaLogger.i(COMPONENT, "Stopping continuous conversation loop")
         _isContinuousMode.value = false
         activeJob?.cancel()
-        voiceInput.stopListening()
+        audioCapture.stopListening()
         audioPlayer.stopPlayback()
         _previewingVoiceId.value = null
         _voiceState.value = VoiceState.IDLE
@@ -204,23 +214,27 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun handleUserVoiceInput(spokenText: String) {
-        lastUserTurnText = spokenText
+    private fun handleCapturedVoice(wavBytes: ByteArray, transcript: String?) {
+        lastUserAudioBytes = wavBytes
+        lastUserTurnText = transcript
+
+        val displayText = if (!transcript.isNullOrBlank()) transcript else "🎙️ [Voice Message]"
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
-            text = spokenText
+            text = displayText
         )
         _messages.value = _messages.value + userMsg
 
-        // Check for phone action intents first (WhatsApp, YouTube, Camera, Settings)
-        val actionResult = phoneActionController.evaluateAndExecute(spokenText)
-        if (actionResult != null) {
-            processActionResponse(actionResult.spokenConfirmation)
-            return
+        // Check for phone action intents if text was transcribed
+        if (!transcript.isNullOrBlank()) {
+            val actionResult = phoneActionController.evaluateAndExecute(transcript)
+            if (actionResult != null) {
+                processActionResponse(actionResult.spokenConfirmation)
+                return
+            }
         }
 
-        // Process with Gemini Native Audio
-        executeGeminiTurn(spokenText)
+        executeGeminiTurn(userAudioBytes = wavBytes, userInputText = transcript)
     }
 
     fun sendTypedMessage(text: String) {
@@ -228,6 +242,7 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
         interruptSpeaking()
 
         lastUserTurnText = text
+        lastUserAudioBytes = null
         val userMsg = ChatMessage(
             sender = MessageSender.USER,
             text = text
@@ -241,10 +256,10 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
 
-        executeGeminiTurn(text)
+        executeGeminiTurn(userAudioBytes = null, userInputText = text)
     }
 
-    private fun executeGeminiTurn(userInput: String) {
+    private fun executeGeminiTurn(userAudioBytes: ByteArray?, userInputText: String?) {
         _voiceState.value = VoiceState.PROCESSING
         _lastErrorMessage.value = null
 
@@ -255,7 +270,8 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
             val memoryNotes = memoryManager.memories.value.map { "${it.key}: ${it.value}" }
 
             val result = geminiService.processVoiceTurn(
-                userInput = userInput,
+                userAudioBytes = userAudioBytes,
+                userInputText = userInputText,
                 mode = _assistantMode.value,
                 voiceName = _selectedVoice.value.id,
                 history = history,
@@ -273,12 +289,23 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
                     _messages.value = _messages.value + sanaMsg
 
                     // Play REAL Gemini Native Audio through phone speaker
-                    _voiceState.value = VoiceState.SPEAKING
+                    // Only set SPEAKING state when playback actually starts!
                     audioPlayer.playGeminiNativeAudio(
                         base64Audio = result.audioBase64,
                         mimeType = result.audioMimeType,
+                        onStarted = {
+                            _voiceState.value = VoiceState.SPEAKING
+                        },
                         onFinished = {
                             onSpeechPlaybackCompleted()
+                        },
+                        onError = { errMsg ->
+                            SanaLogger.e(COMPONENT, "Playback error: $errMsg")
+                            _voiceState.value = VoiceState.ERROR
+                            _lastErrorMessage.value = "Audio output error: $errMsg"
+                            viewModelScope.launch {
+                                _uiEvents.emit(UiEvent.ShowSnackbar("Audio error: $errMsg"))
+                            }
                         }
                     )
                 }
@@ -315,7 +342,6 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
             )
             _messages.value = _messages.value + sanaMsg
 
-            // Generate real Gemini Native Audio for the confirmation
             val (base64Audio, mimeType) = geminiService.synthesizeNativeAudioDirect(
                 text = confirmationText,
                 voiceName = _selectedVoice.value.id,
@@ -323,11 +349,16 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
             )
 
             if (!base64Audio.isNullOrBlank()) {
-                _voiceState.value = VoiceState.SPEAKING
                 audioPlayer.playGeminiNativeAudio(
                     base64Audio = base64Audio,
                     mimeType = mimeType,
+                    onStarted = {
+                        _voiceState.value = VoiceState.SPEAKING
+                    },
                     onFinished = {
+                        onSpeechPlaybackCompleted()
+                    },
+                    onError = {
                         onSpeechPlaybackCompleted()
                     }
                 )
@@ -340,15 +371,17 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
     /**
      * AUTOMATIC RETURN TO LISTENING:
      * When SANA finishes speaking, safely return to LISTENING if continuous mode is active.
+     * Prevents self-listening by keeping mic strictly closed during playback and adding guard delay.
      */
     private fun onSpeechPlaybackCompleted() {
         if (_isContinuousMode.value) {
             viewModelScope.launch {
-                // Buffer delay to prevent acoustic feedback / self-listening
-                delay(300)
+                // Guard delay to allow phone speaker acoustic reverberation to completely settle
+                delay(350)
                 if (_isContinuousMode.value) {
+                    SanaLogger.i(COMPONENT, "Microphone restarted for next turn in continuous conversation")
                     _voiceState.value = VoiceState.LISTENING
-                    voiceInput.startListening()
+                    audioCapture.startListening()
                 } else {
                     _voiceState.value = VoiceState.IDLE
                 }
@@ -359,14 +392,15 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
     }
 
     fun retryLastTurn() {
-        val lastText = lastUserTurnText
-        if (!lastText.isNullOrBlank()) {
+        val audioBytes = lastUserAudioBytes
+        val text = lastUserTurnText
+        if (audioBytes != null || !text.isNullOrBlank()) {
             _lastErrorMessage.value = null
-            executeGeminiTurn(lastText)
+            executeGeminiTurn(audioBytes, text)
         } else if (_isContinuousMode.value) {
             _lastErrorMessage.value = null
             _voiceState.value = VoiceState.LISTENING
-            voiceInput.startListening()
+            audioCapture.startListening()
         }
     }
 
@@ -381,7 +415,6 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
     fun previewVoice(voice: GeminiVoice) {
         interruptSpeaking()
         _previewingVoiceId.value = voice.id
-        _voiceState.value = VoiceState.SPEAKING
 
         activeJob = viewModelScope.launch {
             val (base64Audio, mimeType) = geminiService.synthesizeNativeAudioDirect(
@@ -394,7 +427,14 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
                 audioPlayer.playGeminiNativeAudio(
                     base64Audio = base64Audio,
                     mimeType = mimeType,
+                    onStarted = {
+                        _voiceState.value = VoiceState.SPEAKING
+                    },
                     onFinished = {
+                        _previewingVoiceId.value = null
+                        _voiceState.value = VoiceState.IDLE
+                    },
+                    onError = {
                         _previewingVoiceId.value = null
                         _voiceState.value = VoiceState.IDLE
                     }
@@ -424,6 +464,15 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
         audioPlayer.speechVolume = volume
     }
 
+    fun saveCustomApiKey(key: String) {
+        val trimmed = key.trim()
+        geminiService.customApiKey = trimmed
+        prefs.edit().putString("custom_gemini_api_key", trimmed).apply()
+        viewModelScope.launch {
+            _uiEvents.emit(UiEvent.ShowSnackbar("API key saved successfully."))
+        }
+    }
+
     fun clearConversation() {
         interruptSpeaking()
         _messages.value = emptyList()
@@ -446,6 +495,6 @@ class SanaViewModel(application: Application) : AndroidViewModel(application) {
     override fun onCleared() {
         super.onCleared()
         audioPlayer.release()
-        voiceInput.destroy()
+        audioCapture.destroy()
     }
 }
